@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>spanel — панель проксирования через SSH</title>
+<style>
+:root{--bg:#0b1220;--panel:#111a2e;--border:#223052;--text:#dbe4f3;--muted:#8fa3c7;
+--accent:#5aa9ff;--ok:#3ecf8e;--warn:#ffb454;--err:#ff7b7b}
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text)}
+header{display:flex;align-items:center;gap:12px;padding:16px 24px;border-bottom:1px solid var(--border);background:var(--panel)}
+header h1{font-size:18px;margin:0}
+header .sub{color:var(--muted);font-size:13px}
+main{max-width:1100px;margin:0 auto;padding:24px}
+button{cursor:pointer;border-radius:8px;border:1px solid var(--border);background:#18243c;color:var(--text)}
+.btn{padding:8px 14px;background:var(--accent);color:#04101f;border:none;border-radius:8px;font-weight:600}
+.btn.secondary{background:transparent;color:var(--accent);border:1px solid var(--accent)}
+.btn.danger{background:transparent;color:var(--err);border:1px solid var(--err)}
+.btn.small{padding:4px 10px;font-size:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;margin-bottom:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:16px}
+.badge{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600}
+.b-online,.b-enabled{background:#0d3326;color:var(--ok)}
+.b-offline,.b-target_unreachable,.b-auth_error,.b-host_key_error,.b-key_decrypt_error,.b-http_error,.b-no_active_ssh{background:#3b1616;color:var(--err)}
+.b-connecting,.b-pending_test,.b-timeout,.b-target_timeout,.b-pending_host_key{background:#33280f;color:var(--warn)}
+.b-disabled,.b-disconnected{background:#1c2536;color:var(--muted)}
+input,select,textarea{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--border);
+background:#0d1526;color:var(--text);font:inherit;margin-top:4px}
+textarea{min-height:90px;font-family:ui-monospace,monospace;font-size:12px}
+label{font-size:13px;color:var(--muted);display:block;margin-top:10px}
+.row{display:flex;gap:12px}.row>*{flex:1}
+h2{font-size:15px;margin:0 0 8px}
+.svc{border-top:1px dashed var(--border);margin-top:12px;padding-top:10px;font-size:13px;display:flex;
+justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.svc a{color:var(--accent)}
+.muted{color:var(--muted);font-size:12px}
+.err{color:var(--err);font-size:13px;white-space:pre-wrap}
+.okmsg{color:var(--ok);font-size:13px}
+dialog{background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:14px;
+padding:22px;width:min(560px,92vw)}
+dialog::backdrop{background:#000a}
+.hidden{display:none}
+code{background:#0d1526;padding:2px 6px;border-radius:4px;font-size:12px}
+.tag{display:inline-block;background:#1c2536;border-radius:6px;padding:1px 8px;font-size:11px;margin-right:4px;color:var(--muted)}
+#toast{position:fixed;bottom:20px;right:20px;background:#16233c;border:1px solid var(--border);
+padding:12px 18px;border-radius:10px;display:none;max-width:420px;font-size:13px;z-index:10}
+table.audit{width:100%;border-collapse:collapse;font-size:12px}
+table.audit td{padding:4px 8px;border-bottom:1px solid var(--border);color:var(--muted)}
+.switch{display:flex;gap:8px;margin-top:10px;align-items:center;font-size:13px;color:var(--muted)}
+.switch input{width:auto}
+</style>
+</head>
+<body>
+<header>
+  <h1>⚡ spanel</h1>
+  <span class="sub">Панель проксирования веб-интерфейсов удалённых серверов · режим «без агента, через SSH»</span>
+</header>
+<main>
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+    <h2 style="font-size:17px;margin:0">Серверы проксирования</h2>
+    <button class="btn" onclick="openAdd()">＋ Добавить сервер</button>
+  </div>
+  <div id="servers" class="grid"></div>
+
+  <div class="card" style="margin-top:24px">
+    <h2>Журнал аудита</h2>
+    <table class="audit" id="audit"><tbody></tbody></table>
+  </div>
+</main>
+
+<!-- модалка добавления/редактирования сервера -->
+<dialog id="dlgServer">
+  <h2 id="dlgTitle">Добавить сервер (SSH без агента)</h2>
+  <form id="frmServer">
+    <div class="row">
+      <div><label>Имя сервера *</label><input name="name" required placeholder="SRV1"></div>
+      <div><label>Теги (через запятую)</label><input name="tags" placeholder="prod, kvm"></div>
+    </div>
+    <label>Описание</label><input name="description" placeholder="Proxmox server">
+
+    <fieldset style="border:1px solid var(--border);border-radius:10px;margin-top:14px">
+      <legend class="muted">SSH-подключение</legend>
+      <div class="row">
+        <div><label>SSH host * (IP или домен)</label><input name="host" required placeholder="203.0.113.10"></div>
+        <div style="flex:0 0 110px"><label>SSH port</label><input name="port" type="number" value="22"></div>
+      </div>
+      <div class="row">
+        <div><label>SSH user *</label><input name="username" required placeholder="root"></div>
+        <div><label>Тип аутентификации</label>
+          <select name="auth_type" onchange="toggleAuth(this.value)">
+            <option value="private_key">Приватный ключ</option>
+            <option value="password">Пароль</option>
+          </select>
+        </div>
+      </div>
+      <div id="keyFields">
+        <label>Приватный ключ (вставьте текст) <span id="keyHint" class="muted"></span></label>
+        <textarea name="private_key" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;..."></textarea>
+        <label>Пароль приватного ключа (passphrase), если ключ зашифрован</label>
+        <input name="passphrase" type="password" autocomplete="new-password">
+        <div class="switch"><input type="checkbox" name="clear_key" id="ck"><label for="ck" style="margin:0">Удалить сохранённый ключ</label></div>
+      </div>
+      <div id="passField" class="hidden">
+        <label>SSH пароль <span id="passHint" class="muted"></span></label>
+        <input name="password" type="password" autocomplete="new-password">
+        <div class="switch"><input type="checkbox" name="clear_password" id="cp"><label for="cp" style="margin:0">Удалить сохранённый пароль</label></div>
+      </div>
+      <label>Проверка host key</label>
+      <select name="known_hosts_policy">
+        <option value="tofu">TOFU — подтвердить при первом подключении (рекомендуется)</option>
+        <option value="strict">Strict — блокировать неизвестные ключи</option>
+        <option value="disabled">Disabled — не проверять (небезопасно)</option>
+      </select>
+    </fieldset>
+    <div id="serverResult" style="margin-top:12px"></div>
+    <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">
+      <button type="button" class="btn secondary" onclick="testConn()">🔌 Проверить подключение</button>
+      <button type="submit" class="btn">💾 Сохранить</button>
+      <button type="button" class="btn danger" onclick="closeDlg()">Отмена</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- модалка добавления сервиса (проброса порта) -->
+<dialog id="dlgSvc">
+  <h2>Добавить веб-сервис (проброс через SSH)</h2>
+  <form id="frmSvc">
+    <input type="hidden" name="server_id">
+    <label>Имя сервиса *</label><input name="name" required placeholder="Proxmox">
+    <div class="row">
+      <div><label>Целевой хост на удалённом сервере</label>
+        <select name="target_host">
+          <option value="127.0.0.1">127.0.0.1</option>
+          <option value="localhost">localhost</option>
+          <option value="::1">::1</option>
+        </select>
+      </div>
+      <div><label>Целевой порт веб-панели *</label><input name="target_port" type="number" required placeholder="8006"></div>
+    </div>
+    <div class="row">
+      <div><label>Протокол</label><select name="target_protocol">
+        <option value="http">http</option><option value="https">https</option></select></div>
+      <div><label>Публичный slug</label><input name="public_slug" placeholder="srv1-proxmox"></div>
+    </div>
+    <div class="switch"><input type="checkbox" name="tls_verify" id="tv"><label for="tv" style="margin:0">Проверять сертификат бэкенда (для https; для self-signed лучше выключить)</label></div>
+    <div class="switch"><input type="checkbox" name="is_iframe_allowed" id="if" checked><label for="if" style="margin:0">Разрешить открытие в iframe панели</label></div>
+    <div id="svcResult" style="margin-top:12px"></div>
+    <div style="display:flex;gap:10px;margin-top:16px">
+      <button type="submit" class="btn">Создать проброс</button>
+      <button type="button" class="btn danger" onclick="document.getElementById('dlgSvc').close()">Отмена</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+const $=s=>document.querySelector(s);
+let editingId=null, testOk=false;
+
+function toast(msg,isErr){const t=$('#toast');t.innerHTML=msg;t.style.display='block';
+t.style.borderColor=isErr?'var(--err)':'var(--ok)';setTimeout(()=>t.style.display='none',6000);}
+
+async function api(path,opts={}){
+  const r=await fetch('/api/v1'+path,{headers:{'content-type':'application/json'},...opts});
+  const d=await r.json().catch(()=>({detail:r.statusText}));
+  if(!r.ok) throw new Error(typeof d.detail==='string'?d.detail:JSON.stringify(d.detail||d));
+  return d;
+}
+
+const STATUS_RU={online:'онлайн',offline:'недоступен',connecting:'подключение…',auth_error:'ошибка аутентификации',
+host_key_error:'ошибка host key',timeout:'таймаут',key_decrypt_error:'ошибка расшифровки ключа',
+disabled:'отключён',pending_test:'нужна проверка',pending_host_key:'ждёт подтверждения отпечатка',
+disconnected:'нет активного соединения',enabled:'включён',target_unreachable:'целевой порт недоступен',
+target_timeout:'таймаут цели',tls_error:'TLS ошибка',http_error:'HTTP ошибка',no_active_ssh:'нет SSH-соединения'};
+const badge=s=>`<span class="badge b-${s}">${STATUS_RU[s]||s}</span>`;
+
+async function refresh(){
+  const list=await api('/servers');
+  $('#servers').innerHTML=list.length?list.map(renderCard).join(''):'<div class="card muted">Серверов пока нет. Нажмите «Добавить сервер».</div>';
+  const au=await api('/audit?limit=15');
+  $('#audit tbody').innerHTML=au.map(a=>`<tr><td>${a.ts}</td><td>${a.action}</td><td>${a.object}</td><td>${a.details||''}</td></tr>`).join('')||'<tr><td class="muted">пусто</td></tr>';
+}
+
+function renderCard(s){
+  const svc=(s.services||[]);
+  return `<div class="card" data-id="${s.id}">
+    <div style="display:flex;justify-content:space-between;align-items:start">
+      <h2 style="margin:0">${s.name} ${badge(s.status)}</h2>
+      <span class="muted">${s.live?.active_channels??0} каналов</span>
+    </div>
+    <div class="muted" style="margin:6px 0">${s.description||''}</div>
+    <div>🔑 ${s.ssh.username}@${s.ssh.host}:${s.ssh.port} · ${s.ssh.auth_type==='private_key'?'ключ':'пароль'} · policy=${s.ssh.known_hosts_policy}</div>
+    ${s.ssh.host_key_fingerprint?`<div class="muted" style="word-break:break-all">fingerprint: ${s.ssh.host_key_fingerprint} ${s.ssh.host_key_verified?'✅ подтверждён':'⏳ не подтверждён'}</div>`:''}
+    ${s.last_error?`<div class="err">${s.last_error}</div>`:''}
+    ${s.status==='pending_host_key'||s.status==='host_key_error'?
+      `<button class="btn small" style="margin-top:8px" onclick="confirmKey('${s.id}')">Подтвердить host key</button>`:''}
+    <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+      <button class="btn small secondary" onclick="testById('${s.id}')">Проверить SSH</button>
+      <button class="btn small secondary" onclick="connectNow('${s.id}')">Подключить</button>
+      <button class="btn small" onclick="openSvc('${s.id}','${s.name.replace(/'/g,"\\'")}')">＋ Проброс порта</button>
+      <button class="btn small secondary" onclick="editServer('${s.id}')">Изменить</button>
+      <button class="btn small danger" onclick="delServer('${s.id}','${s.name.replace(/'/g,"\\'")}')">Удалить</button>
+    </div>
+    <div id="res-${s.id}" style="margin-top:8px"></div>
+    ${svc.map(v=>`<div class="svc">
+       <span>${v.is_enabled?'🌐':'⛔'} <b>${v.name}</b> → ${v.target_host}:${v.target_port} (${v.target_protocol}) ${badge(v.status)}</span>
+       <span>
+         <a href="/proxy/${v.public_slug}/" target="_blank" rel="noopener">${v.public_slug} ↗</a>
+         <button class="btn small secondary" onclick="checkSvc('${v.id}')">проверка</button>
+         <button class="btn small secondary" onclick="toggleSvc('${v.id}',${v.is_enabled?0:1})">${v.is_enabled?'выкл':'вкл'}</button>
+         <button class="btn small danger" onclick="delSvc('${v.id}')">✕</button>
+       </span>
+       ${v.last_error?`<div class="err" style="width:100%">${v.last_error}</div>`:''}
+     </div>`).join('')}
+  </div>`;
+}
+
+// ---- add/edit server ----
+function openAdd(){editingId=null;testOk=false;$('#dlgTitle').textContent='Добавить сервер (SSH без агента)';
+  $('#frmServer').reset();$('#keyHint').textContent='';$('#passHint').textContent='';
+  $('#serverResult').innerHTML='';toggleAuth('private_key');$('#dlgServer').showModal();}
+
+async function editServer(id){
+  const s=await api('/servers/'+id);editingId=id;testOk=false;
+  $('#dlgTitle').textContent='Изменить сервер: '+s.name;
+  const f=$('#frmServer');
+  f.name.value=s.name;f.description.value=s.description||'';f.tags.value=(s.tags||[]).join(', ');
+  f.host.value=s.ssh.host;f.port.value=s.ssh.port;f.username.value=s.ssh.username;
+  f.auth_type.value=s.ssh.auth_type;f.known_hosts_policy.value=s.ssh.known_hosts_policy;
+  f.private_key.value='';f.passphrase.value='';f.password.value='';
+  $('#keyHint').textContent=s.ssh.private_key?'[ключ сохранён — поле пустое = не менять]':'';
+  $('#passHint').textContent=s.ssh.password?'•••••••• сохранён — пусто = не менять':'';
+  $('#serverResult').innerHTML='';toggleAuth(s.ssh.auth_type);$('#dlgServer').showModal();
+}
+
+function toggleAuth(v){$('#keyFields').classList.toggle('hidden',v!=='private_key');
+  $('#passField').classList.toggle('hidden',v!=='password');}
+
+function collectBody(){
+  const f=$('#frmServer'),fd=new FormData(f);
+  return {name:fd.get('name'),description:fd.get('description')||'',
+    tags:(fd.get('tags')||'').split(',').map(x=>x.trim()).filter(Boolean),
+    connection_mode:'ssh',
+    ssh:{host:fd.get('host'),port:+fd.get('port')||22,username:fd.get('username'),
+      auth_type:fd.get('auth_type'),known_hosts_policy:fd.get('known_hosts_policy'),
+      private_key:fd.get('private_key')||undefined,passphrase:fd.get('passphrase')||undefined,
+      password:fd.get('password')||undefined,
+      clear_key:!!fd.get('clear_key'),clear_password:!!fd.get('clear_password')}};
+}
+
+$('#frmServer').addEventListener('submit',async e=>{
+  e.preventDefault();const box=$('#serverResult');box.innerHTML='<span class="muted">сохранение…</span>';
+  try{
+    const body=collectBody();
+    let id=editingId;
+    if(editingId){ await api('/servers/'+editingId,{method:'PATCH',body:JSON.stringify(body)}); }
+    else { id=(await api('/servers',{method:'POST',body:JSON.stringify(body)})).id; }
+    // после сохранения сразу пробуем подключить (если есть данные и host key ок)
+    box.innerHTML='<span class="okmsg">Сохранено ✅ Подключение…</span>';
+    const res=await api(`/servers/${id}/ssh/test`,{method:'POST'});
+    box.innerHTML=renderTest(res);
+    await refresh();
+    if(!editingId) closeDlg();
+    else setTimeout(closeDlg,1200);
+  }catch(err){box.innerHTML=`<div class="err">${err.message}</div>`;}
+});
+
+function renderTest(r){
+  if(r.error&&!r.authentication) return `<div class="err">❌ ${r.error}<br><span class="muted">tcp=${r.tcp_reachable} handshake=${r.ssh_handshake} latency=${r.latency_ms}ms</span></div>`;
+  let h=`<div class="okmsg">✅ TCP доступен · SSH handshake ok · аутентификация ok · ${r.latency_ms} ms</div>`;
+  h+=`<div class="muted">Host key: ${r.host_key}</div>`;
+  if(r.needs_host_key_confirm) h+=`<div class="err">⚠ Первое подключение. Подтвердите отпечаток хоста в карточке сервера.</div>`;
+  return h;
+}
+
+function closeDlg(){$('#dlgServer').close();}
+
+async function testById(id){
+  const box=$('#res-'+id);box.innerHTML='<span class="muted">проверка…</span>';
+  try{box.innerHTML=renderTest(await api(`/servers/${id}/ssh/test`,{method:'POST'}));await refresh();}
+  catch(e){box.innerHTML=`<div class="err">${e.message}</div>`;}
+}
+async function connectNow(id){
+  const r=await api(`/servers/${id}/connect`,{method:'POST'});
+  toast(`Статус подключения: ${STATUS_RU[r.status]||r.status}${r.last_error?' — '+r.last_error:''}`,!!r.last_error);
+  setTimeout(refresh,1500);
+}
+async function confirmKey(id){
+  await api(`/servers/${id}/hostkey/confirm`,{method:'POST'});
+  toast('Отпечаток подтверждён. Устанавливаем соединение…');
+  await api(`/servers/${id}/connect`,{method:'POST'});
+  setTimeout(refresh,2000);
+}
+async function delServer(id,name){
+  if(!confirm(`Удалить сервер «${name}»? SSH-ключи будут стёрты из хранилища.`))return;
+  await api('/servers/'+id,{method:'DELETE'});refresh();
+}
+
+// ---- services ----
+function openSvc(sid,name){const f=$('#frmSvc');f.reset();f.server_id.value=sid;
+  f.public_slug.placeholder=(name.toLowerCase().replace(/\s+/g,'-'))+'-PORT';
+  $('#svcResult').innerHTML='';$('#dlgSvc').showModal();}
+
+$('#frmSvc').addEventListener('submit',async e=>{
+  e.preventDefault();const fd=new FormData(e.target);
+  const body={name:fd.get('name'),target_host:fd.get('target_host'),target_port:+fd.get('target_port'),
+    target_protocol:fd.get('target_protocol'),tls_verify:!!fd.get('tls_verify'),
+    public_slug:fd.get('public_slug')||null,is_enabled:true,is_iframe_allowed:!!fd.get('is_iframe_allowed')};
+  try{
+    const r=await api(`/servers/${fd.get('server_id')}/services`,{method:'POST',body:JSON.stringify(body)});
+    $('#svcResult').innerHTML=r.status==='enabled'
+      ?`<div class="okmsg">✅ Проброс создан. Публичный адрес: <a href="${r.public_url.replace('https://tunnel.local','/proxy/'+body.public_slug+'/')}" target="_blank">/proxy/${body.public_slug}/</a> <span class="muted">(в проде: ${r.public_url})</span></div>`
+      :`<div class="err">SSH ok, но порт недоступен: ${r.last_error||'см. статус сервиса'}</div>`;
+    await refresh();setTimeout(()=>{$('#dlgSvc').close();},1800);
+  }catch(err){$('#svcResult').innerHTML=`<div class="err">${err.message}</div>`;}
+});
+
+async function checkSvc(id){
+  const r=await api(`/services/${id}/check`,{method:'POST'});
+  toast(r.reachable?'✅ Порт доступен через SSH-туннель':'❌ '+r.error,!r.reachable);refresh();
+}
+async function toggleSvc(id,en){await api('/services/'+id,{method:'PATCH',body:JSON.stringify({is_enabled:!!en})});refresh();}
+async function delSvc(id){if(confirm('Удалить проброс?')){await api('/services/'+id,{method:'DELETE'});refresh();}}
+
+refresh().catch(e=>toast(e.message,true));
+setInterval(()=>refresh().catch(()=>{}),8000);
+</script>
+</body>
+</html>
