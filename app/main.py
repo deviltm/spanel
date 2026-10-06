@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import threading
 from contextlib import asynccontextmanager
@@ -26,7 +27,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("spanel")
 
 STATIC_DIR = Path(__file__).parent / "static"
-BASE_DOMAIN = "tunnel.local"
+BASE_DOMAIN = os.environ.get("BASE_DOMAIN", "tunnel.local")
 
 
 @asynccontextmanager

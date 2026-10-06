@@ -1,0 +1,19 @@
+services:
+  spanel:
+    build: .
+    container_name: spanel
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # ОБЯЗАТЕЛЬНО задайте мастер-ключ (./scripts/gen_key.sh)
+      SECRETS_ENCRYPTION_KEY: "${SECRETS_ENCRYPTION_KEY:?Задайте SECRETS_ENCRYPTION_KEY в .env или окружении}"
+      BASE_DOMAIN: "${BASE_DOMAIN:-tunnel.local}"
+      PANEL_HOST: 0.0.0.0
+      PANEL_PORT: 8080
+      SPANEL_DATA_DIR: /data
+    volumes:
+      - spanel_data:/data
+
+volumes:
+  spanel_data:
