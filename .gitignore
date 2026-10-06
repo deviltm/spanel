@@ -1,5 +1,5 @@
-__pycache__/
-*.pyc
-.venv/
-.env
-data/
+# Build artifacts
+dist/
+
+# Compressed files
+*.tar.gz
