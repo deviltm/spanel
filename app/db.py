@@ -145,7 +145,10 @@ def update_server(sid: str, name=None, description=None, tags=None) -> None:
 
 def update_ssh_creds(sid: str, ssh: dict) -> None:
     """Обновление SSH-данных. Если ключ/пароль переданы пустыми — старые сохраняются."""
-    sets = ["ssh_host=?", "ssh_port=?", "username=?", "auth_type=?", "known_hosts_policy=?"]
+    sets = ["ssh_host=?", "ssh_port=?", "username=?", "auth_type=?", "known_hosts_policy=?",
+            # при изменении host/port/policy старый fingerprint больше не действителен —
+            # Требуется повторное TOFU-подтверждение (иначе тест падает с 'not found in known_hosts')
+            "host_key_fingerprint=''", "host_key_algorithm=''", "host_key_verified=0"]
     vals = [ssh["host"], int(ssh.get("port", 22)), ssh["username"],
             ssh.get("auth_type", "private_key"), ssh.get("known_hosts_policy", "tofu")]
     if ssh.get("enc_private_key"):

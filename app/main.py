@@ -235,6 +235,21 @@ def confirm_hostkey(sid: str):
     return {"ok": True, "fingerprint": fp}
 
 
+@app.post("/api/v1/servers/{sid}/hostkey/reset")
+def reset_hostkey(sid: str):
+    """Сброс сохранённого отпечатка (например, сервер переустановили)."""
+    s = db.get_server(sid)
+    if not s:
+        raise HTTPException(404, "Сервер не найден")
+    with db._lock, db.get_conn() as c:
+        c.execute("UPDATE ssh_credentials SET host_key_fingerprint='', host_key_algorithm='', "
+                  "host_key_verified=0 WHERE server_id=?", (sid,))
+    manager.disconnect(sid)
+    db.set_server_status(sid, "pending_test", "Отпечаток хоста сброшен — выполните проверку подключения")
+    db.audit("admin", "hostkey.reset", s["name"])
+    return {"ok": True}
+
+
 @app.post("/api/v1/servers/{sid}/connect")
 def connect_now(sid: str):
     s = db.get_server(sid)

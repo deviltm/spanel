@@ -196,6 +196,7 @@ function renderCard(s){
     ${s.last_error?`<div class="err">${s.last_error}</div>`:''}
     ${s.status==='pending_host_key'||s.status==='host_key_error'?
       `<button class="btn small" style="margin-top:8px" onclick="confirmKey('${s.id}')">Подтвердить host key</button>`:''}
+    ${s.ssh.host_key_fingerprint?`<button class="btn small secondary" style="margin-top:8px" onclick="resetKey('${s.id}')">Сбросить host key</button>`:''}
     <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
       <button class="btn small secondary" onclick="testById('${s.id}')">Проверить SSH</button>
       <button class="btn small secondary" onclick="connectNow('${s.id}')">Подключить</button>
@@ -287,6 +288,12 @@ async function connectNow(id){
   toast(`Статус подключения: ${STATUS_RU[r.status]||r.status}${r.last_error?' — '+r.last_error:''}`,!!r.last_error);
   setTimeout(refresh,1500);
 }
+async function resetKey(id){
+  if(!confirm('Сбросить сохранённый отпечаток хоста? Потребуется повторная проверка и подтверждение (например, после переустановки сервера).')) return;
+  await api(`/servers/${id}/hostkey/reset`,{method:'POST'});
+  toast('Отпечаток сброшен. Нажмите «Проверить SSH»'); refresh();
+}
+
 async function confirmKey(id){
   await api(`/servers/${id}/hostkey/confirm`,{method:'POST'});
   toast('Отпечаток подтверждён. Устанавливаем соединение…');

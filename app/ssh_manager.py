@@ -57,6 +57,11 @@ class SSHTunnelManager:
 
     # ---------- public API ----------
 
+    @staticmethod
+    def _hostkey_alias(host: str, port: int) -> str:
+        # OpenSSH-формат записи для нестандартного порта: [host]:port
+        return host if int(port) == 22 else f"[{host}]:{port}"
+
     def test_connection(self, server_id: str) -> dict:
         """Однократная проверка: TCP -> handshake -> auth -> host key. Не сохраняет соединение."""
         result = {"tcp_reachable": False, "ssh_handshake": False, "authentication": False,
@@ -93,24 +98,34 @@ class SSHTunnelManager:
         policy = secrets.get("known_hosts_policy", "tofu")
         saved_fp = secrets.get("host_key_fingerprint") or ""
         seen: dict[str, str] = {}
+        alias = self._hostkey_alias(host, port)
+
+        class _TOFU(paramiko.MissingHostKeyPolicy):
+            """Ключ сервера ещё не подтверждён — принимаем на это подключение
+            и запоминаем в host_keys клиента (как TOFU в OpenSSH). Подтверждение
+            отпечатка администратором происходит через UI/API панели."""
+
+            def missing_host_key(self, cli, hostname, key_):
+                fp = fingerprint_of(key_)
+                if saved_fp and fp != saved_fp:
+                    raise HostKeyChanged(
+                        "Host key сервера изменился. Подключение заблокировано. "
+                        "Возможна атака или сервер был переустановлен.")
+                cli.get_host_keys().add(hostname, key_.get_name(), key_)
+
+        client.set_missing_host_key_policy(_TOFU())
 
         def _policy(key_) -> None:
             fp = fingerprint_of(key_)
             seen["fp"] = fp
             seen["algo"] = key_.get_name()
-            if policy == "disabled":
-                client.get_host_keys().add(host, key_.get_name(), key_)
-                return
-            if saved_fp:
-                if fp != saved_fp:
-                    raise HostKeyChanged(
-                        "Host key сервера изменился. Подключение заблокировано. "
-                        "Возможна атака или сервер был переустановлен.")
-                client.get_host_keys().add(host, key_.get_name(), key_)
-            elif policy == "strict":
+            if saved_fp and fp != saved_fp:
+                raise HostKeyChanged(
+                    "Host key сервера изменился. Подключение заблокировано. "
+                    "Возможна атака или сервер был переустановлен.")
+            if policy == "strict" and not saved_fp:
                 raise HostKeyChanged(f"Host key неизвестен ({fp}). Требуется подтверждение (strict).")
-            else:  # tofu — запоминаем, но просим подтверждения
-                client.get_host_keys().add(host, key_.get_name(), key_)
+            client.get_host_keys().add(alias, key_.get_name(), key_)
 
         try:
             sock = socket.create_connection((host, port), timeout=CONN_TIMEOUT)

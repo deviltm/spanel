@@ -1,5 +1,8 @@
-# Build artifacts
-dist/
+# Virtual environments
+.venv/
+venv/
 
-# Compressed files
-*.tar.gz
+# Python cache and compiled files
+__pycache__/
+*.pyc
+*.so
