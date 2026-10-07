@@ -6,3 +6,15 @@ venv/
 __pycache__/
 *.pyc
 *.so
+
+# Secrets and local config
+.env
+
+# Runtime data (DB, logs)
+data/
+*.db
+*.log
+
+# Build artifacts
+dist/
+*.tar.gz
