@@ -94,23 +94,28 @@ class SSHTunnelManager:
         saved_fp = secrets.get("host_key_fingerprint") or ""
         seen: dict[str, str] = {}
 
+        def _alias(h: str, p: int) -> str:
+            # для нестандартного порта paramiko использует алиас "[host]:port"
+            return h if p == 22 else f"[{h}]:{p}"
+
         def _policy(key_) -> None:
             fp = fingerprint_of(key_)
             seen["fp"] = fp
             seen["algo"] = key_.get_name()
+            alias = _alias(host, port)
             if policy == "disabled":
-                client.get_host_keys().add(host, key_.get_name(), key_)
+                client.get_host_keys().add(alias, key_.get_name(), key_)
                 return
             if saved_fp:
                 if fp != saved_fp:
                     raise HostKeyChanged(
                         "Host key сервера изменился. Подключение заблокировано. "
                         "Возможна атака или сервер был переустановлен.")
-                client.get_host_keys().add(host, key_.get_name(), key_)
+                client.get_host_keys().add(alias, key_.get_name(), key_)
             elif policy == "strict":
                 raise HostKeyChanged(f"Host key неизвестен ({fp}). Требуется подтверждение (strict).")
             else:  # tofu — запоминаем, но просим подтверждения
-                client.get_host_keys().add(host, key_.get_name(), key_)
+                client.get_host_keys().add(alias, key_.get_name(), key_)
 
         try:
             sock = socket.create_connection((host, port), timeout=CONN_TIMEOUT)
@@ -134,6 +139,19 @@ class SSHTunnelManager:
             result["error"] = err
             return result
         except Exception as e:  # noqa: BLE001
+            msg = str(e) or ""
+            # самоизлечение: paramiko хранит host keys в памяти клиента и при нестандартном
+            # порте ищет алиас "[host]:port" — если запись потерялась (перезапуск/смена порта),
+            # сбрасываем отпечаток и просим подтвердить TOFU заново, вместо вечной ошибки
+            if "not found in known_hosts" in msg and policy == "tofu":
+                db.reset_host_key(server_id)
+                err = ("Отпечаток хоста сброшен (paramiko не нашёл запись для "
+                       f"{_alias(host, port)}). Нажмите «Проверить SSH» и подтвердите новый отпечаток.")
+                db.set_server_status(server_id, "pending_host_key", err)
+                result["error"] = ""
+                result["needs_host_key_confirm"] = True
+                result["host_key"] = seen.get("fp", "")
+                return result
             err = f"Ошибка SSH-подключения: {e}"
             db.set_server_status(server_id, "offline", err); db.set_cred_error(server_id, err)
             result["error"] = err
@@ -160,13 +178,20 @@ class SSHTunnelManager:
 
     @staticmethod
     def _authenticate(client: paramiko.SSHClient, secrets: dict) -> None:
+        """Аутентификация на УЖЕ запущенном transport (host key проверен политикой выше).
+
+        ВАЖНО: client.connect(...) здесь запрещён — он вызывает start_client()
+        повторно и проверяет host key по памяти клиента ("Server '[host]:port'
+        not found in known_hosts"). Используем auth-методы транспорта напрямую.
+        """
+        tr = client.get_transport()
+        if tr is None or not tr.is_active():
+            raise ConnectionError("SSH transport не активен")
+        user = secrets["username"]
         if secrets["auth_type"] == "password":
             if not secrets.get("password"):
                 raise paramiko.AuthenticationException("SSH password не задан")
-            client.connect(hostname=secrets["ssh_host"], port=int(secrets["ssh_port"]),
-                           username=secrets["username"], password=secrets["password"],
-                           timeout=CONN_TIMEOUT, banner_timeout=CONN_TIMEOUT,
-                           auth_timeout=CONN_TIMEOUT, allow_agent=False, look_for_keys=False)
+            tr.auth_password(user, secrets["password"])
             return
         pkey_str = secrets.get("private_key") or ""
         if not pkey_str:
@@ -187,10 +212,7 @@ class SSHTunnelManager:
                 last_err = e
         if pkey is None:
             raise paramiko.AuthenticationException(f"Ошибка загрузки/расшифровки ключа: {last_err}") from last_err
-        client.connect(hostname=secrets["ssh_host"], port=int(secrets["ssh_port"]),
-                       username=secrets["username"], pkey=pkey,
-                       timeout=CONN_TIMEOUT, banner_timeout=CONN_TIMEOUT,
-                       auth_timeout=CONN_TIMEOUT, allow_agent=False, look_for_keys=False)
+        tr.auth_publickey(user, pkey)
 
     # ---------- persistent connections ----------
 

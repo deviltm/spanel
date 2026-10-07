@@ -193,6 +193,13 @@ def verify_host_key(sid: str, fp: str, algo: str) -> None:
                   " host_key_verified=1 WHERE server_id=?", (fp, algo, sid))
 
 
+def reset_host_key(sid: str) -> None:
+    """Забыть сохранённый отпечаток хоста (смена host/port/ключей или переустановка сервера)."""
+    with _lock, get_conn() as c:
+        c.execute("UPDATE ssh_credentials SET host_key_fingerprint='', host_key_algorithm='',"
+                  " host_key_verified=0 WHERE server_id=?", (sid,))
+
+
 def delete_server(sid: str) -> None:
     with _lock, get_conn() as c:
         c.execute("DELETE FROM servers WHERE id=?", (sid,))  # каскадно удаляет creds+services

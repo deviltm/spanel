@@ -15,7 +15,8 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi import Response as FastAPIResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from . import db
@@ -192,11 +193,32 @@ def server_patch(sid: str, body: ServerPatch):
         raise HTTPException(404, "Сервер не найден")
     db.update_server(sid, body.name, body.description, body.tags)
     if body.ssh:
+        changed_params = (s.get("ssh_host") != body.ssh.host
+                          or int(s.get("ssh_port") or 22) != body.ssh.port
+                          or s.get("auth_type") != body.ssh.auth_type
+                          or bool(body.ssh.private_key) or bool(body.ssh.password))
         db.update_ssh_creds(sid, _ssh_block_for_update(s, body.ssh))
+        if changed_params:
+            # смена хоста/порта/ключей — старый отпечаток недействителен,
+            # иначе TOFU-сервер навсегда остаётся в host_key_error ("not found in known_hosts")
+            db.reset_host_key(sid)
         # после смены данных — переподключение
         manager.disconnect(sid)
-        db.set_server_status(sid, "pending_test", "Изменены параметры подключения")
+        db.set_server_status(sid, "pending_test", "Изменены параметры подключения — подтвердите отпечаток хоста")
     db.audit("admin", "server.update", s["name"])
+    return {"ok": True}
+
+
+@app.post("/api/v1/servers/{sid}/hostkey/reset")
+def reset_hostkey(sid: str):
+    """Сбросить сохранённый отпечаток хоста (например, сервер переустановлен)."""
+    s = db.get_server(sid)
+    if not s:
+        raise HTTPException(404, "Сервер не найден")
+    db.reset_host_key(sid)
+    manager.disconnect(sid)
+    db.set_server_status(sid, "pending_test", "Отпечаток хоста сброшен — выполните проверку и подтвердите новый")
+    db.audit("admin", "hostkey.reset", s["name"], f"старый fp={s.get('host_key_fingerprint') or 'нет'}")
     return {"ok": True}
 
 
@@ -337,7 +359,26 @@ def audit(limit: int = 50):
 _STRIP_REQ = {"host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
               "te", "trailer", "transfer-encoding", "upgrade-insecure-requests"}
 _STRIP_RESP = {"content-security-policy", "x-frame-options", "content-length",
-               "content-encoding", "transfer-encoding", "connection", "keep-alive"}
+               "content-encoding", "transfer-encoding", "connection", "keep-alive",
+               "date", "server"}  # content-length/date/server пересчитывает uvicorn; set-cookie переписывается отдельно (Path=/)
+
+
+def _relativize_location(value: str, slug: str) -> str:
+    """Преобразовать Location редиректа бэкенда в путь внутри /proxy/<slug>/."""
+    v = value.strip()
+    if v.startswith("/"):
+        return f"/proxy/{slug}/{v.lstrip('/')}"
+    # абсолютный URL на сам бэкенд (127.0.0.1:port) — берём path и относим к префиксу
+    try:
+        from urllib.parse import urlsplit
+        parts = urlsplit(v)
+        if parts.scheme in ("http", "https"):
+            p = parts.path or "/"
+            q = f"?{parts.query}" if parts.query else ""
+            return f"/proxy/{slug}/{p.lstrip('/')}{q}"
+    except ValueError:
+        pass
+    return v
 
 
 def _error_page(code: int, title: str, detail: str) -> HTMLResponse:
@@ -357,6 +398,81 @@ def index():
     return HTMLResponse((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
 
 
+def _release(svc: dict, chan) -> None:
+    """Однократное освобождение SSH-канала и слота счётчика."""
+    try:
+        chan.close()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        tr = getattr(chan, "transport", None)
+        if tr is not None:
+            tr._channel_cleanup(chan)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        manager._release(svc["server_id"])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.websocket("/ws/{slug}/{path:path}")
+@app.websocket("/ws/{slug}")
+async def ws_proxy(ws, slug: str, path: str = ""):
+    """WebSocket через direct-tcpip SSH-канал.
+
+    MVP: прозрачная перекачка фреймов на уровне протокола WS (без разбора HTTP),
+    рукопожатие выполняет starlette/uvicorn с обеих сторон. Для панелей,
+    использующих бинарные кадры (xterm.js, noVNC), требуется полная поддержка
+    framing — см. README (ограничение MVP).
+    """
+    svc = db.get_service_by_slug(slug)
+    if not svc or not svc["is_enabled"]:
+        await ws.close(code=4404)
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        chan = await loop.run_in_executor(
+            None, lambda: manager.open_channel(svc["server_id"], svc["target_host"], svc["target_port"]))
+    except Exception:
+        await ws.close(code=4502)
+        return
+    await ws.accept()
+    state = {"done": threading.Event()}
+
+    async def up():
+        try:
+            while True:
+                msg = await ws.receive()
+                if msg["type"] == "websocket.disconnect":
+                    break
+                data = msg.get("bytes")
+                if data is None:
+                    data = str(msg.get("text") or "").encode()
+                await loop.run_in_executor(None, chan.sendall, data)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            state["done"].set()
+
+    async def down():
+        try:
+            while not state["done"].is_set():
+                data = await loop.run_in_executor(None, chan.recv, 65536)
+                if not data:
+                    break
+                await ws.send_bytes(data)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            state["done"].set()
+
+    try:
+        await asyncio.gather(up(), down())
+    finally:
+        _release(svc, chan)
+
+
 @app.api_route("/proxy/{slug}/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"])
 @app.api_route("/proxy/{slug}", methods=["GET","POST","PUT","PATCH","DELETE","HEAD","OPTIONS"])
 async def proxy(request: Request, slug: str, path: str = ""):
@@ -370,11 +486,18 @@ async def proxy(request: Request, slug: str, path: str = ""):
     if not server:
         return _error_page(404, "Сервер удалён", "Родительский SSH-сервер был удалён.")
 
+    # WebSocket upgrade через HTTP-роутер невозможен — даём явный апгрейд-путь
+    if "websocket" in request.headers.get("upgrade", "").lower():
+        ws_url = f"/ws/{slug}/" + path.lstrip("/")
+        if request.url.query:
+            ws_url += "?" + request.url.query
+        return JSONResponse({"error": "use ws route", "ws_url": ws_url}, status_code=426)
+
     target_path = "/" + path.lstrip("/")
     if request.url.query:
         target_path += "?" + request.url.query
     base = f"{svc['target_protocol']}://{svc['target_host']}:{svc['target_port']}"
-    url = base + quote(target_path)
+    url = base + quote(target_path, safe="/?=&%:,;~@+#!*()")
 
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _STRIP_REQ}
     headers["host"] = f"{svc['target_host']}:{svc['target_port']}"
@@ -383,83 +506,153 @@ async def proxy(request: Request, slug: str, path: str = ""):
     headers["x-forwarded-host"] = f"{slug}.{BASE_DOMAIN}"
     body = await request.body()
 
-    # SSH-канал в пуле потоков (paramiko блокирующий)
+    loop = asyncio.get_running_loop()
+
     def dial():
         return manager.open_channel(svc["server_id"], svc["target_host"], svc["target_port"])
 
     try:
-        chan = await asyncio.get_running_loop().run_in_executor(None, dial)
+        chan = await loop.run_in_executor(None, dial)
     except TimeoutError as e:
         db.set_service_status(svc["id"], "target_timeout", str(e))
         return _error_page(504, "Таймаут SSH", f"{e}<br>Панель не дождалась активного SSH-соединения к «{server['name']}».")
     except PermissionError as e:
         return _error_page(403, "Запрещено политикой", str(e))
     except Exception as e:  # noqa: BLE001
-        code = 502
         db.set_service_status(svc["id"], "no_active_ssh" if "SSH" in str(e) else "target_unreachable", str(e)[:300])
         hint = ""
         if "AllowTcpForwarding" in str(e):
             hint = "<br><br>Совет: включите <code>AllowTcpForwarding yes</code> в /etc/ssh/sshd_config на сервере."
-        return _error_page(code, "Нет доступа к целевому сервису",
-                            f"SSH-подключение к «{server['name']}»: {e}{hint}")
+        return _error_page(502, "Нет доступа к целевому сервису",
+                           f"SSH-подключение к «{server['name']}»: {e}{hint}")
 
-    transport = httpx.AsyncHTTPTransport(socket=chan)
-    client = httpx.AsyncClient(transport=transport, verify=bool(svc["tls_verify"]),
-                               follow_redirects=False, timeout=httpx.Timeout(
-                                   connect=10, read=120, write=120, pool=10))
+    db.touch_service(svc["id"])
+
+    # сырой low-level проксирование поверх SSH-канала: один запрос = один канал,
+    # без keep-alive пула (главный источник «плавающих» 500 при переиспользовании канала)
+    def raw_exchange():
+        req_head = f"{request.method} {target_path} HTTP/1.1\r\n"
+        for k, v in headers.items():
+            req_head += f"{k}: {v}\r\n"
+        req_head += "\r\n"
+        chan.sendall(req_head.encode("latin-1", "ignore"))
+        if body:
+            chan.sendall(body)
+        # читаем статус-строку и заголовки
+        buf = b""
+        deadline = time.time() + 60
+        while b"\r\n\r\n" not in buf:
+            if time.time() > deadline:
+                raise TimeoutError("Бэкенд не ответил заголовками за 60 сек")
+            d = chan.recv(65536)
+            if not d:
+                raise ConnectionError("Бэкенд закрыл соединение до ответа")
+            buf += d
+        head, rest = buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        status_line = lines[0]
+        code = int(status_line.split(" ", 2)[1])
+        rheaders: list[tuple[str, str]] = []
+        for ln in lines[1:]:
+            if ":" in ln:
+                k, _, v = ln.partition(":")
+                rheaders.append((k.strip(), v.strip()))
+        # тело
+        hmap = {k.lower(): v for k, v in rheaders}
+        chunks_out: list[bytes] = []
+        te = hmap.get("transfer-encoding", "").lower()
+        if "chunked" in te:
+            data = rest
+            while True:
+                while b"\r\n" not in data:
+                    d = chan.recv(65536)
+                    if not d:
+                        raise ConnectionError("Обрыв chunked-ответа")
+                    data += d
+                size_s, _, data = data.partition(b"\r\n")
+                size = int(size_s.strip(), 16)
+                if size == 0:
+                    data += chan.recv(2)  # trailing \r\n (без трейлеров)
+                    break
+                while len(data) < size + 2:
+                    d = chan.recv(65536)
+                    if not d:
+                        raise ConnectionError("Обрыв chunked-ответа")
+                    data += d
+                chunks_out.append(data[:size])
+                data = data[size + 2:]
+        elif "content-length" in hmap:
+            need = int(hmap["content-length"])
+            data = rest
+            while len(data) < need:
+                d = chan.recv(65536)
+                if not d:
+                    break
+                data += d
+            chunks_out.append(data[:need])
+        else:
+            # соединение закрывается концом тела (HTTP/1.0-style)
+            data = rest
+            while True:
+                d = chan.recv(65536)
+                if not d:
+                    break
+                data += d
+            chunks_out.append(data)
+        return code, rheaders, chunks_out
 
     try:
-        req = client.build_request(request.method, url, headers=headers, content=body)
-        resp = await client.send(req, stream=True)
-    except httpx.ConnectError as e:
-        chan.close(); manager._release(svc["server_id"]); await client.aclose()
+        code, rheaders, chunks = await loop.run_in_executor(None, raw_exchange)
+    except ConnectionError as e:
+        _release(svc, chan)
         db.set_service_status(svc["id"], "target_unreachable",
                               f"SSH установлен, но {svc['target_host']}:{svc['target_port']} недоступен")
         return _error_page(502, "Целевой порт недоступен",
                            f"SSH-подключение к «{server['name']}» установлено, но порт "
-                           f"<code>{svc['target_port']}</code> недоступен. Проверьте, что веб-сервис запущен.")
-    except httpx.RemoteProtocolError as e:
-        chan.close(); manager._release(svc["server_id"]); await client.aclose()
-        db.set_service_status(svc["id"], "http_error", str(e)[:300])
-        return _error_page(502, "Ошибка протокола бэкенда", str(e))
+                           f"<code>{svc['target_port']}</code> недоступен ({e}). Проверьте, что веб-сервис запущен.")
+    except TimeoutError as e:
+        _release(svc, chan)
+        db.set_service_status(svc["id"], "target_timeout", str(e)[:300])
+        return _error_page(504, "Таймаут бэкенда", str(e))
     except Exception as e:  # noqa: BLE001
-        chan.close(); manager._release(svc["server_id"]); await client.aclose()
+        _release(svc, chan)
         msg = str(e)
-        code = 502
         if "SSL" in msg or "certificate" in msg.lower():
             db.set_service_status(svc["id"], "tls_error", msg[:300])
             return _error_page(502, "TLS ошибка бэкенда",
                                f"Веб-сервис использует HTTPS с самоподписанным сертификатом. "
                                f"Разрешите пропуск проверки сертификата в настройках сервиса.<br>{msg}")
-        if "timeout" in msg.lower():
-            code = 504
-            db.set_service_status(svc["id"], "target_timeout", msg[:300])
-        else:
-            db.set_service_status(svc["id"], "http_error", msg[:300])
-        return _error_page(code, "Ошибка проксирования", msg)
+        db.set_service_status(svc["id"], "http_error", msg[:300])
+        return _error_page(502, "Ошибка проксирования", msg)
 
     db.set_service_status(svc["id"], "enabled", "")
+    _release(svc, chan)
 
-    resp_headers = {k: v for k, v in resp.headers.items() if k.lower() not in _STRIP_RESP}
+    raw_headers: list[tuple[bytes, bytes]] = []
+    for k, v in rheaders:
+        lk = k.lower()
+        if lk == "set-cookie":
+            raw_headers.append((b"set-cookie", _rewrite_set_cookie(v).encode("latin-1", "ignore")))
+            continue
+        if lk in _STRIP_RESP:
+            continue
+        if lk == "location":  # редирект бэкенда -> обратно в префикс панели
+            v = _relativize_location(v, slug)
+        raw_headers.append((k.encode("latin-1"), v.encode("latin-1", "ignore")))
     if not svc["is_iframe_allowed"]:
-        resp_headers["x-frame-options"] = "DENY"
+        raw_headers.append((b"x-frame-options", b"DENY"))
 
-    async def stream():
-        try:
-            async for chunk in resp.aiter_bytes():
-                yield chunk
-        finally:
-            await resp.aclose(); await client.aclose()
-            chan.close(); manager._release(svc["server_id"])
+    payload = b"".join(chunks)
+    return FastAPIResponse(content=payload, status_code=code, headers=None, raw_headers=raw_headers)
 
-    media = resp.headers.get("content-type", "")
-    if "websocket" in request.headers.get("upgrade", "").lower():
-        # WebSocket через direct-tcpip требует отдельного bidirectional pump
-        chan.close(); await client.aclose(); manager._release(svc["server_id"])
-        return _error_page(501, "WebSocket over proxy URL не поддерживается в MVP HTTP-роутера",
-                           "Используйте встроенный ws-pump (см. README).")
-    return StreamingResponse(stream(), status_code=resp.status_code, headers=resp_headers,
-                             media_type=media or None)
+
+def _rewrite_set_cookie(value: str) -> str:
+    """Cookie бэкенда живёт на домене панели; принудительно Path=/, иначе сессия «теряется»."""
+    parts = value.split(";")
+    head = parts[0].strip()
+    attrs = [p.strip() for p in parts[1:] if p.strip().lower() not in ("path=/", "secure")]
+    attrs.insert(0, "Path=/; Secure")
+    return "; ".join([head] + attrs)
 
 
 # loop ref для run_in_executor — не нужен, берём asyncio.get_running_loop() на месте
